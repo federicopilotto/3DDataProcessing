@@ -47,9 +47,7 @@ void FeatureMatcher::extractFeatures()
      std::vector<cv::KeyPoint> tmp_keypoints;
      // Descriptor vector
      cv::Mat tmp_descriptor;
-     //Feature extraction using SIFT
-     cv::Mat image = cv::imread(images_names_[i]);
-     sift_detector->detectAndCompute(image, cv::noArray(), tmp_keypoints,tmp_descriptor);
+     sift_detector->detectAndCompute(img, cv::noArray(), tmp_keypoints,tmp_descriptor);
     
     features_[i] = tmp_keypoints;
     descriptors_[i] = tmp_descriptor;
@@ -150,11 +148,13 @@ void FeatureMatcher::exhaustiveMatching()
         continue;
       }
 
-      //Essential matrix
-      cv::Mat Ess_matrix = cv::findEssentialMat(points1, points2, new_intrinsics_matrix_, cv::RANSAC, 0.999, 1.0);
       // Recover the pose from the Essential matrix
-      cv::Mat R, t;
-      cv::recoverPose(Ess_matrix, points1, points2, R, t, new_intrinsics_matrix_);
+      cv::Mat R, t, E;
+
+      //Essential matrix
+      cv::Mat ess_matrix = cv::findEssentialMat(points1, points2, new_intrinsics_matrix_, cv::RANSAC, 0.999, 1.0, E);
+    
+      cv::recoverPose(ess_matrix, points1, points2, R, t, new_intrinsics_matrix_);
 
       // Estimate the Homography matrix
       cv::Mat H = cv::findHomography(points1, points2, cv::RANSAC, 1.0);
@@ -169,7 +169,7 @@ void FeatureMatcher::exhaustiveMatching()
       // Filter matches using the Homography matrix
       for (size_t k = 0; k < matches.size(); k++)
       {
-        if (Ess_matrix.at<uchar>(k))
+        if (ess_matrix.at<uchar>(k))
         {
           inlier_matches.push_back(matches[k]);
         }

@@ -23,12 +23,48 @@ struct ReprojectionError
   // pay attention to the order of the template parameters
   //////////////////////////////////////////////////////////////////////////////////////////
   
-  
-  
-  
+    // Constructor: store the observed 2D point
+    ReprojectionError(double observed_x, double observed_y)
+        : observed_x_(observed_x), observed_y_(observed_y) {}
+
+    // Operator: given a camera and a 3D point, compute the reprojection residuals
+    template <typename T>
+    bool operator()(const T* const camera, const T* const point, T* residuals) const
+    {
+        //Rotate the point using the camera rotation (AngleAxis)
+        T p[3];
+        ceres::AngleAxisRotatePoint(camera, point, p);
+
+        //Translate the point
+        p[0] += camera[3];
+        p[1] += camera[4];
+        p[2] += camera[5];
+
+        // Project the point onto the normalized image plane
+        T predicted_x = p[0] / p[2];
+        T predicted_y = p[1] / p[2];
+
+        //Compute the residuals (difference between predicted and observed points)
+        residuals[0] = predicted_x - T(observed_x_);
+        residuals[1] = predicted_y - T(observed_y_);
+
+        return true;
+    }
+
+     //Create a Ceres AutoDiffCostFunction for this error
+    static ceres::CostFunction* Create(const double observed_x, const double observed_y)
+      {
+          return (new ceres::AutoDiffCostFunction<ReprojectionError, 2, 6, 3>(
+              new ReprojectionError(observed_x, observed_y)));
+      }
+      // Observed normalized 2D coordinates (what we want to fit)
+      double observed_x_;
+      double observed_y_;
+
+    
+  };
   
   /////////////////////////////////////////////////////////////////////////////////////////
-};
 
 
 namespace
@@ -520,11 +556,41 @@ bool BasicSfM::incrementalReconstruction( int seed_pair_idx0, int seed_pair_idx1
   // In case of "good" sideward motion, store the transformation into init_r_mat and  init_t_vec; defined above
   /////////////////////////////////////////////////////////////////////////////////////////
 
-  
-  
-  
-  
-  
+  // Threshold for RANSAC 
+  double threshold = 0.001;
+
+  // Estimate the Essential matrix
+  cv::Mat E = cv::findEssentialMat(points0, points1, intrinsics_matrix, cv::RANSAC, 0.999, threshold, inlier_mask_E);
+
+  // Estimate the Homography matrix
+  cv::Mat H = cv::findHomography(points0, points1, cv::RANSAC, threshold, inlier_mask_H);
+
+  // Count inliers
+  int num_inliers_E = cv::countNonZero(inlier_mask_E);
+  int num_inliers_H = cv::countNonZero(inlier_mask_H);
+    
+  // Check if E is better than H
+  if (num_inliers_E < num_inliers_H)
+  {
+      std::cout << "Homography has more inliers than Essential matrix. Bad seed pair." << std::endl;
+      return false;
+  }
+    
+  // Recover rotation and translation from Essential matrix
+  cv::Mat R, t;
+  cv::recoverPose(E, points0, points1, intrinsics_matrix, R, t, inlier_mask_E);
+
+  // Check if motion is mostly sideward (not forward)
+  if (std::abs(t.at<double>(0)) + std::abs(t.at<double>(1)) < 2 * std::abs(t.at<double>(2)))
+  {
+      std::cout << "Motion is mainly forward. Bad seed pair." << std::endl;
+      return false;
+  }
+
+  // Good motion, store R and t
+  init_r_mat = R.clone();
+  init_t_vec = t.clone();
+
   
 
   /////////////////////////////////////////////////////////////////////////////////////////
@@ -712,11 +778,82 @@ bool BasicSfM::incrementalReconstruction( int seed_pair_idx0, int seed_pair_idx1
             // pt[2] = /*X coordinate of the estimated point */;
             /////////////////////////////////////////////////////////////////////////////////////////
 
-                
-                
+            // Extract rotation and translation from camera 0 (new_cam_pose_idx)
+            cv::Mat rvec0(3, 1, CV_64F), tvec0(3, 1, CV_64F);
+            for (int i = 0; i < 3; ++i)
+                rvec0.at<double>(i) = cam0_data[i];
+            for (int i = 0; i < 3; ++i)
+                tvec0.at<double>(i) = cam0_data[i + 3];
 
-                
-                
+            //Convert axis-angle to rotation matrix
+            cv::Mat R0;
+            cv::Rodrigues(rvec0, R0);
+
+            //Build projection matrix P0
+            cv::Mat P0 = cv::Mat::zeros(3, 4, CV_64F);
+            R0.copyTo(P0(cv::Rect(0, 0, 3, 3)));
+            tvec0.copyTo(P0(cv::Rect(3, 0, 1, 3)));
+                            
+            // Extract rotation and translation from camera 1 (cam_idx) as fot camera 0
+            cv::Mat rvec1(3, 1, CV_64F), tvec1(3, 1, CV_64F);
+            for (int i = 0; i < 3; ++i)
+                rvec1.at<double>(i) = cam1_data[i];
+            for (int i = 0; i < 3; ++i)
+                tvec1.at<double>(i) = cam1_data[i + 3];
+
+            cv::Mat R1;
+            cv::Rodrigues(rvec1, R1);
+
+            cv::Mat P1 = cv::Mat::zeros(3, 4, CV_64F);
+            R1.copyTo(P1(cv::Rect(0, 0, 3, 3)));
+            tvec1.copyTo(P1(cv::Rect(3, 0, 1, 3)));           
+
+            // Get the two points in image coordinates from the observations
+            std::vector<cv::Point2d> pts0(1), pts1(1);
+
+            pts0[0].x = observations_[2 * cam_observation_[new_cam_pose_idx][pt_idx] + 0];
+            pts0[0].y = observations_[2 * cam_observation_[new_cam_pose_idx][pt_idx] + 1];
+
+            pts1[0].x = observations_[2 * cam_observation_[cam_idx][pt_idx] + 0];
+            pts1[0].y = observations_[2 * cam_observation_[cam_idx][pt_idx] + 1];
+
+            // Triangulate
+            cv::Mat hpoints4D;
+            cv::triangulatePoints(P0, P1, pts0, pts1, hpoints4D);
+
+            // Homogeneous to Cartesian
+            cv::Mat point3D = hpoints4D.col(0);
+            point3D /= point3D.at<double>(3);
+
+
+            double p0[3], p1[3];
+            double point3D_array[3] = { point3D.at<double>(0), point3D.at<double>(1), point3D.at<double>(2) };
+
+            // Rotate and translate
+            ceres::AngleAxisRotatePoint(cam0_data, point3D_array, p0);
+            //transform point wrt camera 0
+            p0[0] += cam0_data[3];
+            p0[1] += cam0_data[4];
+            p0[2] += cam0_data[5];
+
+            ceres::AngleAxisRotatePoint(cam1_data, point3D_array, p1);
+            //transform point wrt camera 1
+            p1[0] += cam1_data[3];
+            p1[1] += cam1_data[4];
+            p1[2] += cam1_data[5];
+
+            if (p0[2] > 0 && p1[2] > 0) // cheirality check
+            {
+                n_new_pts++;
+                pts_optim_iter_[pt_idx] = 1;
+                double* pt = pointBlockPtr(pt_idx);
+                pt[0] = point3D.at<double>(0);
+                pt[1] = point3D.at<double>(1);
+                pt[2] = point3D.at<double>(2);
+            }
+
+
+
             /////////////////////////////////////////////////////////////////////////////////////////
 
           }
@@ -774,12 +911,40 @@ bool BasicSfM::incrementalReconstruction( int seed_pair_idx0, int seed_pair_idx1
     // the previous camera and point positions were updated during this iteration.
     /////////////////////////////////////////////////////////////////////////////////////////
 
-    // ....
-    //  if( <bad reconstruction> )
-    //    return false;
+    
+
+    // First check: based on reconstruction volume (max_dist)
+    if (max_dist > 1000.0) // threshold can be adjusted based on experiments
+    {
+        std::cout << "Reconstruction diverged: volume too large" << std::endl;
+        return false;
+    }
+    /**
+     // Second check: based on how much parameters changed during optimization
+    double total_change = 0.0;
+    int count = 0;
+
+    for (int i = 0; i < num_parameters_; i++)
+    {
+        double diff = parameters_[i] - bck_parameters[i];
+        total_change += diff * diff;
+        count++;
+    }
+
+    double average_change = std::sqrt(total_change / count);
+
+    // If the average parameter update is too large, it suggests divergence
+    if (average_change > 5.0) // you can tune this threshold experimentally
+    {
+        std::cout << "Reconstruction diverged: parameters moved too much" << std::endl;
+        return false;
+    }
+     */
+
 
     /////////////////////////////////////////////////////////////////////////////////////////
   }
+  
 
   return true;
 
@@ -832,12 +997,27 @@ void BasicSfM::bundleAdjustmentIter( int new_cam_idx )
         // The camera position blocks have size (camera_block_size_) of 6 elements,
         // while the point position blocks have size (point_block_size_) of 3 elements.
         //////////////////////////////////////////////////////////////////////////////////
-        
+       
+        // Extract the observed 2D point
+        double observed_x = observations_[2 * i_obs];
+        double observed_y = observations_[2 * i_obs + 1];
 
-        
-        
-        
-        
+        // Create the reprojection error cost function
+        ceres::CostFunction* cost_function =
+            ReprojectionError::Create(observed_x, observed_y);
+
+        // Optional: use a robust loss function to reduce outlier influence
+        ceres::LossFunction* loss_function = new ceres::CauchyLoss(2.0 * max_reproj_err_);
+
+        // Add the residual block
+        problem.AddResidualBlock(
+            cost_function,
+            loss_function,
+            cameraBlockPtr(cam_pose_index_[i_obs]),
+            pointBlockPtr(point_index_[i_obs])
+        );
+
+
         /////////////////////////////////////////////////////////////////////////////////////////
 
       }
